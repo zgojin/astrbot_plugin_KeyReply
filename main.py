@@ -7,7 +7,7 @@ import os
 import re
 
 
-@register("enhanced_plugin", "Your Name", "一个包含多指令处理及问答记录功能的插件", "1.0.0", "repo url")
+@register("enhanced_plugin", "长安某", "关键词回复", "1.0.0", "repo url")
 class EnhancedPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
