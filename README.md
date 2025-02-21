@@ -1,10 +1,8 @@
-# helloworld
+# 感谢
 
-AstrBot 插件模板
+感谢【惊蛰】老板的支持，哥们第一次赚钱
 
-A template plugin for AstrBot plugin feature
 
-# 支持
-
-[帮助文档](https://astrbot.soulter.top/center/docs/%E5%BC%80%E5%8F%91/%E6%8F%92%E4%BB%B6%E5%BC%80%E5%8F%91/
-)
+# 更新计划
+- 1.0 暂时实现了图片，文字的关键词回复，以及模糊搜索
+- 2.0 支持更多例如 视频、声音、转发消息等
