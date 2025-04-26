@@ -6,29 +6,30 @@ import yaml
 import os
 import re
 
-
-@register("enhanced_plugin", "长安某", "关键词回复", "1.0.0", "repo url")
+@register("enhanced_plugin", "长安某", "关键词回复", "1.1.0", "https://github.com/your-repo-url")
 class EnhancedPlugin(Star):
     def __init__(self, context: Context):
         super().__init__(context)
+        
         # 构建存储问答对的 YAML 文件路径
-        yaml_path = os.path.join('data', 'plugins', 'keyword_reply', 'triggers.yml')
-        directory = os.path.dirname(yaml_path)
+        self.yaml_path = os.path.join('data', 'plugins', 'keyword_reply', 'triggers.yml')
+        directory = os.path.dirname(self.yaml_path)
         # 若目录不存在则创建
         if not os.path.exists(directory):
             os.makedirs(directory)
 
         # 若 YAML 文件不存在，创建一个空的问答对配置
-        if not os.path.exists(yaml_path):
+        if not os.path.exists(self.yaml_path):
             default_triggers = {"triggers": {}}
-            with open(yaml_path, 'w', encoding='utf-8') as f:
+            with open(self.yaml_path, 'w', encoding='utf-8') as f:
                 yaml.dump(default_triggers, f, allow_unicode=True, indent=2)
 
         # 从 YAML 文件加载问答对
-        with open(yaml_path, 'r', encoding='utf-8') as f:
+        with open(self.yaml_path, 'r', encoding='utf-8') as f:
             data = yaml.safe_load(f)
             self.triggers = data.get('triggers', {})
 
+        # 初始化记录状态
         self.recording = False
         self.temp_question = None
         self.temp_question_images = []
@@ -36,11 +37,27 @@ class EnhancedPlugin(Star):
         self.current_group_id = None
         self.current_sender_id = None
 
+        # 加载允许的群组配置
+        self.allowed_groups_path = os.path.join('data', 'plugins', 'keyword_reply', 'allowed_groups.yml')
+        if not os.path.exists(self.allowed_groups_path):
+            default_allowed = {"allowed_groups": []}
+            with open(self.allowed_groups_path, 'w', encoding='utf-8') as f:
+                yaml.dump(default_allowed, f, allow_unicode=True, indent=2)
+        
+        with open(self.allowed_groups_path, 'r', encoding='utf-8') as f:
+            allowed_data = yaml.safe_load(f)
+            self.allowed_groups = allowed_data.get('allowed_groups', [])
+
     @filter.command("开始记录")
     async def start_recording(self, event: AstrMessageEvent):
         message_obj = event.message_obj
         group_id = message_obj.group_id
         sender_id = event.get_sender_id()
+        
+        # 检查是否来自允许的群组
+        if str(group_id) not in self.allowed_groups:
+            return
+        
         # 避免不同群或用户同时记录
         if self.recording and (self.current_group_id != group_id or self.current_sender_id != sender_id):
             return
@@ -61,6 +78,10 @@ class EnhancedPlugin(Star):
         sender_id = event.get_sender_id()
         message_str = event.message_str
         message_chain = message_obj.message
+
+        # 检查是否来自允许的群组
+        if str(group_id) not in self.allowed_groups:
+            return
 
         if self.recording:
             # 忽略非当前记录群或用户的消息
@@ -91,9 +112,8 @@ class EnhancedPlugin(Star):
                 self.triggers[str(question)] = answer
 
                 # 保存问答对到 YAML 文件
-                yaml_path = os.path.join('data', 'plugins', 'keyword_reply', 'triggers.yml')
                 data = {"triggers": self.triggers}
-                with open(yaml_path, 'w', encoding='utf-8') as f:
+                with open(self.yaml_path, 'w', encoding='utf-8') as f:
                     yaml.dump(data, f, allow_unicode=True, indent=2)
 
                 # 结束记录状态
@@ -122,6 +142,13 @@ class EnhancedPlugin(Star):
 
     @filter.command("查看关键词")
     async def view_keywords(self, event: AstrMessageEvent):
+        message_obj = event.message_obj
+        group_id = message_obj.group_id
+        
+        # 检查是否来自允许的群组
+        if str(group_id) not in self.allowed_groups:
+            return
+
         # 若没有关键词，提示用户
         if not self.triggers:
             yield event.make_result().message("当前没有记录任何关键词。")
@@ -136,6 +163,13 @@ class EnhancedPlugin(Star):
 
     @filter.command("删除关键词")
     async def delete_keyword(self, event: AstrMessageEvent):
+        message_obj = event.message_obj
+        group_id = message_obj.group_id
+        
+        # 检查是否来自允许的群组
+        if str(group_id) not in self.allowed_groups:
+            return
+
         message_str = event.message_str
         parts = message_str.split(" ", 1)
         if len(parts) < 2:
@@ -155,10 +189,53 @@ class EnhancedPlugin(Star):
         if target_question_str:
             # 删除关键词及其对应答案
             del self.triggers[target_question_str]
-            yaml_path = os.path.join('data', 'plugins', 'keyword_reply', 'triggers.yml')
             data = {"triggers": self.triggers}
-            with open(yaml_path, 'w', encoding='utf-8') as f:
+            with open(self.yaml_path, 'w', encoding='utf-8') as f:
                 yaml.dump(data, f, allow_unicode=True, indent=2)
             yield event.make_result().message(f"关键词 '{keyword}' 及其回复信息已成功删除。")
         else:
             yield event.make_result().message(f"未找到关键词 '{keyword}'。")
+
+    @filter.command("添加群组")
+    async def add_group(self, event: AstrMessageEvent):
+        message_str = event.message_str
+        parts = message_str.split(" ", 1)
+        if len(parts) < 2:
+            yield event.make_result().message("请提供要添加的群号，格式为：添加群组 群号")
+            return
+        
+        group_id = parts[1]
+        if group_id not in self.allowed_groups:
+            self.allowed_groups.append(group_id)
+            data = {"allowed_groups": self.allowed_groups}
+            with open(self.allowed_groups_path, 'w', encoding='utf-8') as f:
+                yaml.dump(data, f, allow_unicode=True, indent=2)
+            yield event.make_result().message(f"已添加群组 {group_id} 到允许列表。")
+        else:
+            yield event.make_result().message(f"群组 {group_id} 已在允许列表中。")
+
+    @filter.command("删除群组")
+    async def remove_group(self, event: AstrMessageEvent):
+        message_str = event.message_str
+        parts = message_str.split(" ", 1)
+        if len(parts) < 2:
+            yield event.make_result().message("请提供要删除的群号，格式为：删除群组 群号")
+            return
+        
+        group_id = parts[1]
+        if group_id in self.allowed_groups:
+            self.allowed_groups.remove(group_id)
+            data = {"allowed_groups": self.allowed_groups}
+            with open(self.allowed_groups_path, 'w', encoding='utf-8') as f:
+                yaml.dump(data, f, allow_unicode=True, indent=2)
+            yield event.make_result().message(f"已将群组 {group_id} 从允许列表中移除。")
+        else:
+            yield event.make_result().message(f"群组 {group_id} 不在允许列表中。")
+
+    @filter.command("查看允许的群组")
+    async def view_allowed_groups(self, event: AstrMessageEvent):
+        if not self.allowed_groups:
+            yield event.make_result().message("当前没有允许的群组。")
+        else:
+            groups_text = "\n".join(self.allowed_groups)
+            yield event.make_result().message(f"当前允许的群组如下：\n{groups_text}")
