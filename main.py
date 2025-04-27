@@ -5,6 +5,9 @@ from astrbot.api.message_components import Plain, Image
 import yaml
 import os
 import re
+import uuid
+import time
+import threading
 
 @register("enhanced_plugin", "长安某", "关键词回复", "1.1.0", "https://github.com/your-repo-url")
 class EnhancedPlugin(Star):
@@ -12,22 +15,11 @@ class EnhancedPlugin(Star):
         super().__init__(context)
         
         # 构建存储问答对的 YAML 文件路径
-        self.yaml_path = os.path.join('data', 'plugins', 'keyword_reply', 'triggers.yml')
-        directory = os.path.dirname(self.yaml_path)
+        self.base_path = os.path.join('data', 'plugins', 'keyword_reply')
+        directory = os.path.dirname(self.base_path)
         # 若目录不存在则创建
         if not os.path.exists(directory):
             os.makedirs(directory)
-
-        # 若 YAML 文件不存在，创建一个空的问答对配置
-        if not os.path.exists(self.yaml_path):
-            default_triggers = {"triggers": {}}
-            with open(self.yaml_path, 'w', encoding='utf-8') as f:
-                yaml.dump(default_triggers, f, allow_unicode=True, indent=2)
-
-        # 从 YAML 文件加载问答对
-        with open(self.yaml_path, 'r', encoding='utf-8') as f:
-            data = yaml.safe_load(f)
-            self.triggers = data.get('triggers', {})
 
         # 初始化记录状态
         self.recording = False
@@ -38,7 +30,7 @@ class EnhancedPlugin(Star):
         self.current_sender_id = None
 
         # 加载允许的群组配置
-        self.allowed_groups_path = os.path.join('data', 'plugins', 'keyword_reply', 'allowed_groups.yml')
+        self.allowed_groups_path = os.path.join(self.base_path, 'allowed_groups.yml')
         if not os.path.exists(self.allowed_groups_path):
             default_allowed = {"allowed_groups": []}
             with open(self.allowed_groups_path, 'w', encoding='utf-8') as f:
@@ -47,6 +39,43 @@ class EnhancedPlugin(Star):
         with open(self.allowed_groups_path, 'r', encoding='utf-8') as f:
             allowed_data = yaml.safe_load(f)
             self.allowed_groups = allowed_data.get('allowed_groups', [])
+
+        # 热重载相关
+        self.last_modified_time = self.get_file_modified_time(self.allowed_groups_path)
+        self.hot_reload_lock = threading.Lock()
+        self.hot_reload_thread = threading.Thread(target=self.hot_reload_worker)
+        self.hot_reload_thread.daemon = True
+        self.hot_reload_thread.start()
+
+    def get_file_modified_time(self, file_path):
+        try:
+            return os.path.getmtime(file_path)
+        except FileNotFoundError:
+            return 0
+
+    def hot_reload_worker(self):
+        while True:
+            current_modified_time = self.get_file_modified_time(self.allowed_groups_path)
+            if current_modified_time > self.last_modified_time:
+                with self.hot_reload_lock:
+                    with open(self.allowed_groups_path, 'r', encoding='utf-8') as f:
+                        allowed_data = yaml.safe_load(f)
+                        self.allowed_groups = allowed_data.get('allowed_groups', [])
+                    self.last_modified_time = current_modified_time
+                    print("Allowed groups reloaded.")
+            time.sleep(5)  # 检查间隔时间
+
+    def get_group_triggers_path(self, group_id):
+        return os.path.join(self.base_path, f'{group_id}_triggers.yml')
+
+    def load_group_triggers(self, group_id):
+        triggers_path = self.get_group_triggers_path(group_id)
+        if not os.path.exists(triggers_path):
+            with open(triggers_path, 'w', encoding='utf-8') as f:
+                yaml.dump({"triggers": {}}, f, allow_unicode=True, indent=2)
+        with open(triggers_path, 'r', encoding='utf-8') as f:
+            data = yaml.safe_load(f)
+            return data.get('triggers', {})
 
     @filter.command("开始记录")
     async def start_recording(self, event: AstrMessageEvent):
@@ -61,6 +90,10 @@ class EnhancedPlugin(Star):
         # 避免不同群或用户同时记录
         if self.recording and (self.current_group_id != group_id or self.current_sender_id != sender_id):
             return
+
+        # 加载当前群组的触发词
+        self.triggers = self.load_group_triggers(group_id)
+        self.yaml_path = self.get_group_triggers_path(group_id)
 
         # 开启记录状态
         self.recording = True
@@ -82,6 +115,10 @@ class EnhancedPlugin(Star):
         # 检查是否来自允许的群组
         if str(group_id) not in self.allowed_groups:
             return
+
+        # 加载当前群组的触发词
+        self.triggers = self.load_group_triggers(group_id)
+        self.yaml_path = self.get_group_triggers_path(group_id)
 
         if self.recording:
             # 忽略非当前记录群或用户的消息
@@ -108,8 +145,9 @@ class EnhancedPlugin(Star):
 
                 question = {"text": self.temp_question, "images": self.temp_question_images}
                 answer = {"text": answer_text, "images": answer_images}
-                # 存储问答对
-                self.triggers[str(question)] = answer
+                # 使用唯一标识符作为键
+                unique_id = str(uuid.uuid4())
+                self.triggers[unique_id] = {"question": question, "answer": answer}
 
                 # 保存问答对到 YAML 文件
                 data = {"triggers": self.triggers}
@@ -126,8 +164,9 @@ class EnhancedPlugin(Star):
                 yield event.make_result().message("答案已记录，新的问答对已保存。")
         else:
             # 非记录状态下，使用正则匹配消息并回复
-            for question_str, answer in self.triggers.items():
-                question = eval(question_str)
+            for unique_id, qa_pair in self.triggers.items():
+                question = qa_pair["question"]
+                answer = qa_pair["answer"]
                 pattern = question["text"].replace("%", ".*")
                 if re.search(pattern, message_str):
                     reply_chain = []
@@ -149,13 +188,16 @@ class EnhancedPlugin(Star):
         if str(group_id) not in self.allowed_groups:
             return
 
+        # 加载当前群组的触发词
+        self.triggers = self.load_group_triggers(group_id)
+
         # 若没有关键词，提示用户
         if not self.triggers:
             yield event.make_result().message("当前没有记录任何关键词。")
         else:
             keyword_list = []
-            for question_str in self.triggers.keys():
-                question = eval(question_str)
+            for unique_id, qa_pair in self.triggers.items():
+                question = qa_pair["question"]
                 keyword_list.append(question["text"])
             keyword_text = "\n".join(keyword_list)
             # 发送关键词列表给用户
@@ -178,17 +220,21 @@ class EnhancedPlugin(Star):
             return
 
         keyword = parts[1]
-        target_question_str = None
+        # 加载当前群组的触发词
+        self.triggers = self.load_group_triggers(group_id)
+        self.yaml_path = self.get_group_triggers_path(group_id)
+
+        target_unique_id = None
         # 查找要删除的关键词
-        for question_str in self.triggers.keys():
-            question = eval(question_str)
+        for unique_id, qa_pair in self.triggers.items():
+            question = qa_pair["question"]
             if question["text"] == keyword:
-                target_question_str = question_str
+                target_unique_id = unique_id
                 break
 
-        if target_question_str:
+        if target_unique_id:
             # 删除关键词及其对应答案
-            del self.triggers[target_question_str]
+            del self.triggers[target_unique_id]
             data = {"triggers": self.triggers}
             with open(self.yaml_path, 'w', encoding='utf-8') as f:
                 yaml.dump(data, f, allow_unicode=True, indent=2)
@@ -228,6 +274,10 @@ class EnhancedPlugin(Star):
             data = {"allowed_groups": self.allowed_groups}
             with open(self.allowed_groups_path, 'w', encoding='utf-8') as f:
                 yaml.dump(data, f, allow_unicode=True, indent=2)
+            # 删除该群组的触发词文件
+            triggers_path = self.get_group_triggers_path(group_id)
+            if os.path.exists(triggers_path):
+                os.remove(triggers_path)
             yield event.make_result().message(f"已将群组 {group_id} 从允许列表中移除。")
         else:
             yield event.make_result().message(f"群组 {group_id} 不在允许列表中。")
