@@ -8,6 +8,10 @@ import re
 import uuid
 import time
 import threading
+import logging
+
+# 配置日志
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 @register("enhanced_plugin", "长安某", "关键词回复", "1.1.0", "https://github.com/your-repo-url")
 class EnhancedPlugin(Star):
@@ -33,15 +37,21 @@ class EnhancedPlugin(Star):
         self.allowed_groups_path = os.path.join(self.base_path, 'allowed_groups.yml')
         if not os.path.exists(self.allowed_groups_path):
             default_allowed = {"allowed_groups": []}
-            with open(self.allowed_groups_path, 'w', encoding='utf-8') as f:
-                yaml.dump(default_allowed, f, allow_unicode=True, indent=2)
+            self.save_yaml(self.allowed_groups_path, default_allowed)
         
-        with open(self.allowed_groups_path, 'r', encoding='utf-8') as f:
-            allowed_data = yaml.safe_load(f)
-            self.allowed_groups = allowed_data.get('allowed_groups', [])
+        self.allowed_groups = self.load_yaml(self.allowed_groups_path).get('allowed_groups', [])
+
+        # 加载管理员白名单配置
+        self.admins_path = os.path.join(self.base_path, 'admins.yml')
+        if not os.path.exists(self.admins_path):
+            default_admins = {"admins": []}
+            self.save_yaml(self.admins_path, default_admins)
+        
+        self.admins = self.load_yaml(self.admins_path).get('admins', [])
 
         # 热重载相关
         self.last_modified_time = self.get_file_modified_time(self.allowed_groups_path)
+        self.admins_last_modified_time = self.get_file_modified_time(self.admins_path)
         self.hot_reload_lock = threading.Lock()
         self.hot_reload_thread = threading.Thread(target=self.hot_reload_worker)
         self.hot_reload_thread.daemon = True
@@ -53,16 +63,41 @@ class EnhancedPlugin(Star):
         except FileNotFoundError:
             return 0
 
+    def load_yaml(self, file_path):
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                return yaml.safe_load(f)
+        except Exception as e:
+            logging.error(f"Error loading YAML file {file_path}: {e}")
+            return {}
+
+    def save_yaml(self, file_path, data):
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                yaml.dump(data, f, allow_unicode=True, indent=2)
+        except Exception as e:
+            logging.error(f"Error saving YAML file {file_path}: {e}")
+
     def hot_reload_worker(self):
         while True:
-            current_modified_time = self.get_file_modified_time(self.allowed_groups_path)
-            if current_modified_time > self.last_modified_time:
-                with self.hot_reload_lock:
-                    with open(self.allowed_groups_path, 'r', encoding='utf-8') as f:
-                        allowed_data = yaml.safe_load(f)
+            try:
+                current_modified_time = self.get_file_modified_time(self.allowed_groups_path)
+                if current_modified_time > self.last_modified_time:
+                    with self.hot_reload_lock:
+                        allowed_data = self.load_yaml(self.allowed_groups_path)
                         self.allowed_groups = allowed_data.get('allowed_groups', [])
-                    self.last_modified_time = current_modified_time
-                    print("Allowed groups reloaded.")
+                        self.last_modified_time = current_modified_time
+                        logging.info("Allowed groups reloaded.")
+
+                current_admins_modified_time = self.get_file_modified_time(self.admins_path)
+                if current_admins_modified_time > self.admins_last_modified_time:
+                    with self.hot_reload_lock:
+                        admins_data = self.load_yaml(self.admins_path)
+                        self.admins = admins_data.get('admins', [])
+                        self.admins_last_modified_time = current_admins_modified_time
+                        logging.info("Admins list reloaded.")
+            except Exception as e:
+                logging.error(f"Error in hot reload worker: {e}")
             time.sleep(5)  # 检查间隔时间
 
     def get_group_triggers_path(self, group_id):
@@ -71,11 +106,18 @@ class EnhancedPlugin(Star):
     def load_group_triggers(self, group_id):
         triggers_path = self.get_group_triggers_path(group_id)
         if not os.path.exists(triggers_path):
-            with open(triggers_path, 'w', encoding='utf-8') as f:
-                yaml.dump({"triggers": {}}, f, allow_unicode=True, indent=2)
-        with open(triggers_path, 'r', encoding='utf-8') as f:
-            data = yaml.safe_load(f)
-            return data.get('triggers', {})
+            self.save_yaml(triggers_path, {"triggers": {}})
+        return self.load_yaml(triggers_path).get('triggers', {})
+
+    def is_admin(self, sender_id):
+        return str(sender_id) in self.admins
+
+    def add_admin_if_empty(self, sender_id):
+        if not self.admins:
+            self.admins.append(str(sender_id))
+            data = {"admins": self.admins}
+            self.save_yaml(self.admins_path, data)
+            logging.info(f"Added initial admin: {sender_id}")
 
     @filter.command("开始记录")
     async def start_recording(self, event: AstrMessageEvent):
@@ -83,8 +125,14 @@ class EnhancedPlugin(Star):
         group_id = message_obj.group_id
         sender_id = event.get_sender_id()
         
+        # 检查是否是管理员
+        if not self.is_admin(sender_id):
+            yield event.make_result().message("你没有权限执行此命令。")
+            return
+
         # 检查是否来自允许的群组
         if str(group_id) not in self.allowed_groups:
+            yield event.make_result().message("此群组未被允许使用该功能。")
             return
         
         # 避免不同群或用户同时记录
@@ -151,8 +199,7 @@ class EnhancedPlugin(Star):
 
                 # 保存问答对到 YAML 文件
                 data = {"triggers": self.triggers}
-                with open(self.yaml_path, 'w', encoding='utf-8') as f:
-                    yaml.dump(data, f, allow_unicode=True, indent=2)
+                self.save_yaml(self.yaml_path, data)
 
                 # 结束记录状态
                 self.recording = False
@@ -183,9 +230,16 @@ class EnhancedPlugin(Star):
     async def view_keywords(self, event: AstrMessageEvent):
         message_obj = event.message_obj
         group_id = message_obj.group_id
+        sender_id = event.get_sender_id()
         
+        # 检查是否是管理员
+        if not self.is_admin(sender_id):
+            yield event.make_result().message("你没有权限执行此命令。")
+            return
+
         # 检查是否来自允许的群组
         if str(group_id) not in self.allowed_groups:
+            yield event.make_result().message("此群组未被允许使用该功能。")
             return
 
         # 加载当前群组的触发词
@@ -207,9 +261,16 @@ class EnhancedPlugin(Star):
     async def delete_keyword(self, event: AstrMessageEvent):
         message_obj = event.message_obj
         group_id = message_obj.group_id
+        sender_id = event.get_sender_id()
         
+        # 检查是否是管理员
+        if not self.is_admin(sender_id):
+            yield event.make_result().message("你没有权限执行此命令。")
+            return
+
         # 检查是否来自允许的群组
         if str(group_id) not in self.allowed_groups:
+            yield event.make_result().message("此群组未被允许使用该功能。")
             return
 
         message_str = event.message_str
@@ -236,14 +297,23 @@ class EnhancedPlugin(Star):
             # 删除关键词及其对应答案
             del self.triggers[target_unique_id]
             data = {"triggers": self.triggers}
-            with open(self.yaml_path, 'w', encoding='utf-8') as f:
-                yaml.dump(data, f, allow_unicode=True, indent=2)
+            self.save_yaml(self.yaml_path, data)
             yield event.make_result().message(f"关键词 '{keyword}' 及其回复信息已成功删除。")
         else:
             yield event.make_result().message(f"未找到关键词 '{keyword}'。")
 
     @filter.command("添加群组")
     async def add_group(self, event: AstrMessageEvent):
+        sender_id = event.get_sender_id()
+        
+        # 如果管理员列表为空，自动添加当前发送者为管理员
+        self.add_admin_if_empty(sender_id)
+
+        # 检查是否是管理员
+        if not self.is_admin(sender_id):
+            yield event.make_result().message("你没有权限执行此命令。")
+            return
+
         message_str = event.message_str
         parts = message_str.split(" ", 1)
         if len(parts) < 2:
@@ -254,14 +324,23 @@ class EnhancedPlugin(Star):
         if group_id not in self.allowed_groups:
             self.allowed_groups.append(group_id)
             data = {"allowed_groups": self.allowed_groups}
-            with open(self.allowed_groups_path, 'w', encoding='utf-8') as f:
-                yaml.dump(data, f, allow_unicode=True, indent=2)
+            self.save_yaml(self.allowed_groups_path, data)
             yield event.make_result().message(f"已添加群组 {group_id} 到允许列表。")
         else:
             yield event.make_result().message(f"群组 {group_id} 已在允许列表中。")
 
     @filter.command("删除群组")
     async def remove_group(self, event: AstrMessageEvent):
+        sender_id = event.get_sender_id()
+        
+        # 如果管理员列表为空，自动添加当前发送者为管理员
+        self.add_admin_if_empty(sender_id)
+
+        # 检查是否是管理员
+        if not self.is_admin(sender_id):
+            yield event.make_result().message("你没有权限执行此命令。")
+            return
+
         message_str = event.message_str
         parts = message_str.split(" ", 1)
         if len(parts) < 2:
@@ -272,20 +351,104 @@ class EnhancedPlugin(Star):
         if group_id in self.allowed_groups:
             self.allowed_groups.remove(group_id)
             data = {"allowed_groups": self.allowed_groups}
-            with open(self.allowed_groups_path, 'w', encoding='utf-8') as f:
-                yaml.dump(data, f, allow_unicode=True, indent=2)
+            self.save_yaml(self.allowed_groups_path, data)
             # 删除该群组的触发词文件
             triggers_path = self.get_group_triggers_path(group_id)
             if os.path.exists(triggers_path):
-                os.remove(triggers_path)
+                try:
+                    os.remove(triggers_path)
+                except Exception as e:
+                    logging.error(f"Error deleting triggers file {triggers_path}: {e}")
             yield event.make_result().message(f"已将群组 {group_id} 从允许列表中移除。")
         else:
             yield event.make_result().message(f"群组 {group_id} 不在允许列表中。")
 
     @filter.command("查看允许的群组")
     async def view_allowed_groups(self, event: AstrMessageEvent):
+        sender_id = event.get_sender_id()
+        
+        # 如果管理员列表为空，自动添加当前发送者为管理员
+        self.add_admin_if_empty(sender_id)
+
+        # 检查是否是管理员
+        if not self.is_admin(sender_id):
+            yield event.make_result().message("你没有权限执行此命令。")
+            return
+
         if not self.allowed_groups:
             yield event.make_result().message("当前没有允许的群组。")
         else:
             groups_text = "\n".join(self.allowed_groups)
             yield event.make_result().message(f"当前允许的群组如下：\n{groups_text}")
+
+    @filter.command("添加管理员")
+    async def add_admin(self, event: AstrMessageEvent):
+        sender_id = event.get_sender_id()
+        
+        # 如果管理员列表为空，自动添加当前发送者为管理员
+        self.add_admin_if_empty(sender_id)
+
+        # 检查是否是管理员
+        if not self.is_admin(sender_id):
+            yield event.make_result().message("你没有权限执行此命令。")
+            return
+
+        message_str = event.message_str
+        parts = message_str.split(" ", 1)
+        if len(parts) < 2:
+            yield event.make_result().message("请提供要添加的管理员QQ号，格式为：添加管理员 QQ号")
+            return
+        
+        admin_id = parts[1]
+        if admin_id not in self.admins:
+            self.admins.append(admin_id)
+            data = {"admins": self.admins}
+            self.save_yaml(self.admins_path, data)
+            yield event.make_result().message(f"已添加管理员 {admin_id} 到白名单。")
+        else:
+            yield event.make_result().message(f"管理员 {admin_id} 已在白名单中。")
+
+    @filter.command("删除管理员")
+    async def remove_admin(self, event: AstrMessageEvent):
+        sender_id = event.get_sender_id()
+        
+        # 如果管理员列表为空，自动添加当前发送者为管理员
+        self.add_admin_if_empty(sender_id)
+
+        # 检查是否是管理员
+        if not self.is_admin(sender_id):
+            yield event.make_result().message("你没有权限执行此命令。")
+            return
+
+        message_str = event.message_str
+        parts = message_str.split(" ", 1)
+        if len(parts) < 2:
+            yield event.make_result().message("请提供要删除的管理员QQ号，格式为：删除管理员 QQ号")
+            return
+        
+        admin_id = parts[1]
+        if admin_id in self.admins:
+            self.admins.remove(admin_id)
+            data = {"admins": self.admins}
+            self.save_yaml(self.admins_path, data)
+            yield event.make_result().message(f"已将管理员 {admin_id} 从白名单中移除。")
+        else:
+            yield event.make_result().message(f"管理员 {admin_id} 不在白名单中。")
+
+    @filter.command("查看管理员白名单")
+    async def view_admins(self, event: AstrMessageEvent):
+        sender_id = event.get_sender_id()
+        
+        # 如果管理员列表为空，自动添加当前发送者为管理员
+        self.add_admin_if_empty(sender_id)
+
+        # 检查是否是管理员
+        if not self.is_admin(sender_id):
+            yield event.make_result().message("你没有权限执行此命令。")
+            return
+
+        if not self.admins:
+            yield event.make_result().message("当前没有管理员。")
+        else:
+            admins_text = "\n".join(self.admins)
+            yield event.make_result().message(f"当前管理员白名单如下：\n{admins_text}")
